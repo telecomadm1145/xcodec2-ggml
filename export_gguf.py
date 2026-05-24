@@ -24,8 +24,9 @@ def build_fsq_codebook(levels, proj_out_w, proj_out_b=None):
     codes = np.zeros((total, cdim), dtype=np.float32)
     for idx in range(total):
         r = idx
-        for d in range(cdim - 1, -1, -1):
-            codes[idx, d] = r % levels[d]; r //= levels[d]
+        for d in range(cdim):
+            codes[idx, d] = r % levels[d]
+            r //= levels[d]
     for d in range(cdim):
         L = levels[d]
         codes[:, d] = 2.0 * codes[:, d] / (L - 1) - 1.0 if L > 1 else 0.0
@@ -42,16 +43,22 @@ def load_model(model_path):
 
     # Try safetensors first (for models like Anime-XCodec2)
     try:
-        from huggingface_hub import hf_hub_download
+        if os.path.isdir(model_path):
+            ckpt_path = os.path.join(model_path, "model.safetensors")
+        else:
+            from huggingface_hub import hf_hub_download
+            ckpt_path = hf_hub_download(repo_id=model_path, filename="model.safetensors")
+        
         from safetensors import safe_open
-        ckpt_path = hf_hub_download(repo_id=model_path, filename="model.safetensors")
         ckpt = {}
         with safe_open(ckpt_path, framework="pt", device="cpu") as f:
             for k in f.keys():
                 ckpt[k.replace(".beta", ".bias")] = f.get_tensor(k)
         config = BigCodecConfig.from_pretrained(model_path)
-        model = XCodec2Model.from_pretrained(None, config=config, state_dict=ckpt)
-    except Exception:
+        model = XCodec2Model(config)
+        model.load_state_dict(ckpt)
+    except Exception as e:
+        print(f"Fallback loading from_pretrained: {e}")
         model = XCodec2Model.from_pretrained(model_path)
     model.eval()
     return model
@@ -100,8 +107,9 @@ def export(model_path, output_path, use_f16=False):
 
     # 1. FSQ Codebook
     q = model.generator.quantizer
-    fsq = q.fsqs[0]
-    levels = [int(l) for l in fsq.levels.tolist()]
+    fsq = q.layers[0] if hasattr(q, 'layers') else q.fsqs[0]
+    levels_t = fsq._levels if hasattr(fsq, '_levels') else fsq.levels
+    levels = [int(l) for l in levels_t.tolist()]
     pw = q.project_out.weight.detach().cpu().numpy()
     pb = q.project_out.bias.detach().cpu().numpy() if q.project_out.bias is not None else None
     cb = build_fsq_codebook(levels, pw, pb)

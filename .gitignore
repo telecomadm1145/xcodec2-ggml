@@ -35,3 +35,8 @@ Thumbs.db
 *.safetensors
 *.pt
 *.pth
+
+*.wav
+__pycache__/
+*.dot
+*.txt

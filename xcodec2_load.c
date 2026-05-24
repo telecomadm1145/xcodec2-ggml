@@ -1,5 +1,6 @@
 /* xcodec2_load.c - GGUF model loading */
 #include "xcodec2.h"
+#include "ggml-cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,7 @@ static void load_resnet(struct xcodec2_resnet_block * blk, struct ggml_context *
 #undef L
 }
 
-int xcodec2_load(struct xcodec2_model * model, const char * path) {
+int xcodec2_load(struct xcodec2_model * model, const char * path, bool use_gpu) {
     struct gguf_init_params params = { .no_alloc = false, .ctx = &model->ctx_data };
     model->ctx_gguf = gguf_init_from_file(path, params);
     if (!model->ctx_gguf) { fprintf(stderr, "failed to load %s\n", path); return -1; }
@@ -86,11 +87,117 @@ int xcodec2_load(struct xcodec2_model * model, const char * path) {
     model->head_out_b   = get_tensor(ctx, "head.out.bias");
     model->istft_window = get_tensor(ctx, "head.istft.window");
 
-    printf("xcodec2: loaded %d tensors\n", gguf_get_n_tensors(model->ctx_gguf));
+    /* Upsampler */
+    model->n_upsamplers = 0;
+    while (model->n_upsamplers < 4) {
+        snprintf(buf, sizeof(buf), "upsampler.%d.conv.weight", model->n_upsamplers);
+        if (ggml_get_tensor(ctx, buf)) {
+            model->n_upsamplers++;
+        } else {
+            break;
+        }
+    }
+    for (int i = 0; i < model->n_upsamplers; i++) {
+        snprintf(buf, sizeof(buf), "upsampler.%d.conv.weight", i);
+        model->upsampler[i].conv_w = get_tensor(ctx, buf);
+        snprintf(buf, sizeof(buf), "upsampler.%d.conv.bias", i);
+        model->upsampler[i].conv_b = get_tensor(ctx, buf);
+        
+        struct xcodec2_resnet_block * rblk = &model->upsampler[i].resnet;
+#define L(field, sfx) \
+        snprintf(buf, sizeof(buf), "upsampler.%d.resnet." sfx, i); \
+        rblk->field = get_tensor(ctx, buf);
+        L(norm1_w, "norm1.weight") L(norm1_b, "norm1.bias")
+        L(conv1_w, "conv1.weight") L(conv1_b, "conv1.bias")
+        L(norm2_w, "norm2.weight") L(norm2_b, "norm2.bias")
+        L(conv2_w, "conv2.weight") L(conv2_b, "conv2.bias")
+#undef L
+    }
+    if (model->n_upsamplers > 0) {
+        model->upsampler_out_proj_w = get_tensor(ctx, "upsampler.out_proj.weight");
+        model->upsampler_out_proj_b = get_tensor(ctx, "upsampler.out_proj.bias");
+    }
+
+    // Initialize backend (Vulkan or CPU)
+    ggml_backend_load_all();
+    model->backend = NULL;
+    if (use_gpu) {
+        model->backend = ggml_backend_init_by_name("Vulkan", NULL);
+        if (!model->backend) {
+            model->backend = ggml_backend_init_by_name("vulkan", NULL);
+        }
+        if (model->backend) {
+            printf("xcodec2: using Vulkan GPU backend\n");
+        } else {
+            printf("xcodec2: Vulkan backend not available, falling back to CPU\n");
+        }
+    }
+    if (!model->backend) {
+        model->backend = ggml_backend_cpu_init();
+        printf("xcodec2: using CPU backend\n");
+    }
+    
+    if (model->backend) {
+        
+        // Save original CPU pointers and set to NULL to allow backend allocation
+        int n_tensors = 0;
+        for (struct ggml_tensor * t = ggml_get_first_tensor(model->ctx_data); t != NULL; t = ggml_get_next_tensor(model->ctx_data, t)) {
+            n_tensors++;
+        }
+        
+        void ** cpu_ptrs = (void **)malloc(n_tensors * sizeof(void *));
+        struct ggml_tensor ** tensors = (struct ggml_tensor **)malloc(n_tensors * sizeof(struct ggml_tensor *));
+        
+        int idx = 0;
+        for (struct ggml_tensor * t = ggml_get_first_tensor(model->ctx_data); t != NULL; t = ggml_get_next_tensor(model->ctx_data, t)) {
+            cpu_ptrs[idx] = t->data;
+            tensors[idx] = t;
+            t->data = NULL;
+            idx++;
+        }
+        
+        // Temporarily set no_alloc to true to satisfy GGML assertion
+        ggml_set_no_alloc(model->ctx_data, true);
+        
+        // Allocate buffer on backend
+        model->buffer_w = ggml_backend_alloc_ctx_tensors(model->ctx_data, model->backend);
+        
+        // Restore no_alloc
+        ggml_set_no_alloc(model->ctx_data, false);
+        
+        if (!model->buffer_w) {
+            fprintf(stderr, "xcodec2: failed to allocate weight buffer on backend\n");
+            // Restore CPU pointers on failure
+            for (int i = 0; i < n_tensors; i++) {
+                tensors[i]->data = cpu_ptrs[i];
+            }
+            free(cpu_ptrs);
+            free(tensors);
+            return -1;
+        }
+        
+        // Copy weight data from CPU to backend tensors
+        for (int i = 0; i < n_tensors; i++) {
+            if (cpu_ptrs[i] != NULL && tensors[i]->view_src == NULL) {
+                ggml_backend_tensor_set(tensors[i], cpu_ptrs[i], 0, ggml_nbytes(tensors[i]));
+            }
+        }
+        
+        free(cpu_ptrs);
+        free(tensors);
+        printf("xcodec2: model weights copied to backend memory\n");
+    } else {
+        fprintf(stderr, "xcodec2: failed to initialize backend\n");
+        return -1;
+    }
+
+    printf("xcodec2: loaded %lld tensors\n", (long long)gguf_get_n_tensors(model->ctx_gguf));
     return 0;
 }
 
 void xcodec2_free(struct xcodec2_model * model) {
+    if (model->buffer_w) { ggml_backend_buffer_free(model->buffer_w); model->buffer_w = NULL; }
+    if (model->backend) { ggml_backend_free(model->backend); model->backend = NULL; }
     if (model->ctx_data) { ggml_free(model->ctx_data); model->ctx_data = NULL; }
     if (model->ctx_gguf) { gguf_free(model->ctx_gguf); model->ctx_gguf = NULL; }
 }

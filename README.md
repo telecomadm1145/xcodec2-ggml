@@ -1,111 +1,187 @@
 # xcodec2-ggml
 
-A C/C++ implementation of the [XCodec2](https://github.com/zhenye234/xcodec2) neural audio codec decoder using [ggml](https://github.com/ggml-org/llama.cpp/tree/master/ggml), with optional [llama.cpp](https://github.com/ggml-org/llama.cpp) integration for a full Text-to-Speech (TTS) pipeline.
+A highly optimized C/C++ implementation of the [XCodec2](https://github.com/zhenye234/X-Codec-2.0) neural audio codec decoder using [ggml](https://github.com/ggml-org/llama.cpp/tree/master/ggml), with optional [llama.cpp](https://github.com/ggml-org/llama.cpp) integration for a full Text-to-Speech (TTS) pipeline.
 
-## Features
+This repository provides a suite of CLI tools and an HTTP API server for text-to-speech token generation and audio decoding, with optional Vulkan GPU acceleration.
 
-- **xcodec2 decoder** — Decodes speech token IDs to audio waveforms using a GGUF model
-- **Full TTS pipeline** — Chains an LLM (via llama.cpp) with xcodec2 for end-to-end text-to-speech
-- **Quantization tool** — Quantize xcodec2 models to Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, or F16
-- **GPU acceleration** — Vulkan and CPU (AVX2/FMA) backends via ggml
-- **Cross-platform** — Builds on Windows and Linux
+### Download Pre-exported Models
+You can download pre-exported GGUF decoder models (fp16 & f32 version) directly from Hugging Face:
+- **XCodec2 Decoder GGUF Model**: [telecomadm1145/Anime-XCodec2-44.1kHz-v2-decoder-gguf](https://huggingface.co/telecomadm1145/Anime-XCodec2-44.1kHz-v2-decoder-gguf)
 
-## Building
+---
+
+## Tool Suite
+
+After building, the project produces the following binaries:
+- `xcodec2-tts` — End-to-end Text-to-Speech CLI tool. Integrates with `llama-server` (HTTP) or `llama-cli` (subprocess) to generate speech tokens and decode them to WAV.
+- `xcodec2-server` — Lightweight HTTP server. Exposes endpoints for decoding speech tokens (`/decode`) and performing end-to-end TTS (`/tts`) to return binary WAV audio.
+- `xcodec2-decode` — Standalone decoder that converts raw speech token files directly into WAV audio.
+- `xcodec2-quantize` — Quantizer to compress xcodec2 GGUF models into Q8_0, Q4_0, etc.
+
+---
+
+## Building the Code
 
 ### Prerequisites
-
 - CMake 3.14+
-- A C/C++ compiler (Clang 19+, MSVC 19+, or GCC 11+)
-- Ninja (recommended) or Make
-- (Optional) [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) for GPU acceleration
+- A C/C++ compiler (Visual Studio 2022 / MSVC, Clang, or GCC)
+- Ninja build system (highly recommended)
+- (Optional) [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) for GPU decoding support
 
-### Windows (Visual Studio 2022 + Clang 19)
+### 1. Windows (MSVC + Clang + Vulkan)
+
+Open a standard command shell (or PowerShell) and invoke the compilation within the Visual Studio developer environment (using `vcvarsall.bat` so standard headers are resolved correctly for nested builds):
 
 ```powershell
-# Open VS Developer Command Prompt, then:
-set VULKAN_SDK=C:\VulkanSDK\1.4.350.0
-
-cmake -G Ninja ^
-  -DCMAKE_C_COMPILER="C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe" ^
-  -DCMAKE_CXX_COMPILER="C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe" ^
-  -DGGML_VULKAN=ON ^
-  -DCMAKE_BUILD_TYPE=Release .
-
-ninja -j8
+# Setup VS environment, configure CMake, and build
+cmd.exe /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64 && cmake -DGGML_OPENMP=OFF -DGGML_VULKAN=ON . && ninja'
 ```
 
-### Linux
+*Note: We disable OpenMP (`-DGGML_OPENMP=OFF`) to bypass symbol conflicts with Strawberry Perl's compiler runtime on Windows, allowing clean linking with Clang.*
+
+### 2. Linux
+```bash
+cmake -DGGML_VULKAN=ON -DGGML_OPENMP=OFF -DCMAKE_BUILD_TYPE=Release .
+ninja
+```
+
+---
+
+## Vulkan GPU Decoding Acceleration
+
+By default, **Vulkan decoding is disabled at runtime** to avoid competing for VRAM with the larger LLM (e.g. `llama-server`).
+To enable Vulkan GPU acceleration for decoding, pass the `--gpu` or `--vulkan` flags to `xcodec2-tts`, `xcodec2-server`, or `xcodec2-decode`. If GPU acceleration is not available or initialization fails, the model will gracefully fall back to CPU decoding.
+
+---
+
+## Usage Instructions
+
+### 1. `xcodec2-tts` (End-to-End TTS CLI)
+Supports three distinct modes of operation:
+
+#### Mode A: Server Mode (Inference via running `llama-server`)
+Generates speech tokens by querying a running `llama-server` HTTP instance, then decodes them locally.
+```bash
+./xcodec2-tts.exe --url http://localhost:8080 -c xcodec2.gguf -t "Hello, welcome to xcodec2!" -o output.wav
+```
+
+#### Mode B: CLI Subprocess Mode (Inference via launching `llama-cli` binary)
+Launches a local `llama-cli` subprocess to run the LLM inference.
+```bash
+./xcodec2-tts.exe --cli /path/to/llama-cli.exe -m /path/to/llm.gguf -c xcodec2.gguf -t "Text to generate" -o output.wav
+```
+
+#### Mode C: Direct Token Decoding Mode
+Directly converts a string of space/comma-separated tokens or `<|s_xxxx|>` formatted tags to WAV audio.
+```bash
+./xcodec2-tts.exe --tokens "<|s_10023|><|s_29014|><|s_512|>" -c xcodec2.gguf -o output.wav
+# Or:
+./xcodec2-tts.exe --tokens "10023, 29014, 512" -c xcodec2.gguf -o output.wav
+```
+
+#### CLI Options:
+- `-c <path>` — Path to xcodec2 GGUF model (default: `xcodec2.gguf`)
+- `-o <path>` — Path to output WAV file (default: `output.wav`)
+- `-t <text>` — Input inline text for TTS
+- `-f <path>` — Input text file for TTS
+- `-n <max>` — Max tokens to generate (default: `2048`)
+- `--temp <val>` — LLM sampling temperature (default: `0.8`)
+- `--top-p <val>` — LLM top-p sampling (default: `0.95`)
+- `--top-k <val>` — LLM top-k sampling (default: `50`)
+- `--repeat-penalty <val>` — Repetition penalty to prevent generation loops (default: `1.1`)
+- `--gpu` or `--vulkan` — Enable Vulkan GPU acceleration for decoding
+- `--save-tokens <path>` — Save generated token IDs to a text file
+- `--debug-tokens` — Print generated speech token IDs during execution
+- `--no-decode` — Skip decoding to WAV, only output the speech tokens
+
+---
+
+### 2. `xcodec2-server` (HTTP Audio Service)
+Starts a lightweight HTTP server to handle token decoding and TTS requests.
 
 ```bash
-cmake -G Ninja \
-  -DGGML_VULKAN=ON \
-  -DCMAKE_BUILD_TYPE=Release .
-
-ninja -j$(nproc)
+# Start server on default port 8082, with GPU decoding enabled
+./xcodec2-server.exe -c xcodec2.gguf --port 8082 --gpu
 ```
 
-### Without Vulkan (CPU only)
+#### Endpoints:
 
+##### `GET /health`
+Returns server status.
+```json
+{ "status": "ok" }
+```
+
+##### `POST /decode`
+Decodes an array of token IDs or formatted token strings directly to WAV audio.
+- **Request Body (JSON)**:
+  ```json
+  { "tokens": [10023, 29014, 512] }
+  // Or:
+  { "tokens": "<|s_10023|><|s_29014|><|s_512|>" }
+  // Or:
+  { "tokens": "10023, 29014, 512" }
+  ```
+- **Response**: Binary stream of `audio/wav`
+- **Example Curl**:
+  ```bash
+  curl -X POST -H "Content-Type: application/json" -d "{\"tokens\": [1023, 5678, 912]}" http://localhost:8082/decode -o output.wav
+  ```
+
+##### `POST /tts`
+Performs end-to-end TTS by querying a backend `llama-server` instance to generate speech tokens, then decodes them to WAV.
+- **Request Body (JSON)**:
+  ```json
+  {
+    "text": "Hello, this is generated entirely via the xcodec2 server API.",
+    "llama_url": "http://localhost:8080",
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "top_k": 50,
+    "repeat_penalty": 1.1,
+    "max_tokens": 2048
+  }
+  ```
+- **Response**: Binary stream of `audio/wav`
+- **Example Curl**:
+  ```bash
+  curl -X POST -H "Content-Type: application/json" -d "{\"text\": \"Hello from the API!\", \"llama_url\": \"http://localhost:8080\"}" http://localhost:8082/tts -o tts_output.wav
+  ```
+
+---
+
+### 3. `xcodec2-decode` (Standalone Decoder CLI)
+Converts a file containing whitespace or newline-separated speech token integers to WAV.
 ```bash
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release .
-ninja -j$(nproc)
+./xcodec2-decode.exe -m xcodec2.gguf -i codes.txt -o output.wav [--gpu]
 ```
 
-## Usage
+---
 
-### 1. Export model to GGUF
-
-Convert the PyTorch XCodec2 model to GGUF format:
-
+### 4. `xcodec2-quantize` (Model Compression)
+Quantizes the xcodec2 GGUF model into compressed formats to reduce disk usage and speed up CPU memory access.
 ```bash
-python export_gguf.py --model-dir /path/to/xcodec2 --output xcodec2.gguf
+./xcodec2-quantize.exe xcodec2.gguf xcodec2-q8_0.gguf q8_0
 ```
+*Supported quant types: `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `f16`.*
 
-### 2. (Optional) Quantize
-
-```bash
-./xcodec2_quantize xcodec2.gguf xcodec2-q8_0.gguf q8_0
-```
-
-### 3a. Standalone decoder (codes → WAV)
-
-```bash
-./xcodec2_decode -m xcodec2.gguf -i codes.txt -o output.wav
-```
-
-Where `codes.txt` contains one integer speech token ID per line.
-
-### 3b. Full TTS pipeline (text → WAV)
-
-```bash
-./xcodec2_tts -m llasa-3b.gguf -c xcodec2.gguf -t "Hello, world!" -o output.wav
-```
-
-Options:
-- `-m` — Path to LLM GGUF model (e.g., Llasa-3B)
-- `-c` — Path to xcodec2 GGUF model
-- `-t` — Input text
-- `-o` — Output WAV file (default: `output.wav`)
-- `-ngl` — Number of GPU layers (default: 99)
-- `-n` — Max tokens (default: 2048)
-- `--temp` — Temperature (default: 0.8)
-- `--top-p` — Top-p sampling (default: 1.0)
-- `--rep-penalty` — Repetition penalty (default: 1.1)
+---
 
 ## Project Structure
 
 | File | Description |
 |------|-------------|
-| `CMakeLists.txt` | Build configuration (fetches llama.cpp via FetchContent) |
-| `xcodec2.h` | Public API and model structures |
-| `xcodec2.c` | Decoder inference + ISTFT + standalone CLI |
-| `xcodec2_graph.c` | ggml compute graph construction |
-| `xcodec2_load.c` | GGUF model loading |
-| `main.cpp` | Full TTS pipeline (LLM + xcodec2) |
-| `quantize.cpp` | Model quantization tool |
-| `export_gguf.py` | PyTorch → GGUF converter |
-| `export_ggml.py` | Alternative ggml export script |
+| [CMakeLists.txt](file:///c:/Users/Administrator/Downloads/xcodec2-0.1.7.tar/xcodec2-0.1.7/ggml/CMakeLists.txt) | Build configuration (fetches llama.cpp dynamically) |
+| [xcodec2.h](file:///c:/Users/Administrator/Downloads/xcodec2-0.1.7.tar/xcodec2-0.1.7/ggml/xcodec2.h) | Public API and structure definitions |
+| [xcodec2.c](file:///c:/Users/Administrator/Downloads/xcodec2-0.1.7.tar/xcodec2-0.1.7/ggml/xcodec2.c) | Decoder graph execution + ISTFT + standalone decoder CLI |
+| [xcodec2_load.c](file:///c:/Users/Administrator/Downloads/xcodec2-0.1.7.tar/xcodec2-0.1.7/ggml/xcodec2_load.c) | Model GGUF loader & Vulkan/CPU backend allocator |
+| [xcodec2_graph.c](file:///c:/Users/Administrator/Downloads/xcodec2-0.1.7.tar/xcodec2-0.1.7/ggml/xcodec2_graph.c) | ggml graph builder |
+| [main.cpp](file:///c:/Users/Administrator/Downloads/xcodec2-0.1.7.tar/xcodec2-0.1.7/ggml/main.cpp) | `xcodec2-tts` source code |
+| [server.cpp](file:///c:/Users/Administrator/Downloads/xcodec2-0.1.7.tar/xcodec2-0.1.7/ggml/server.cpp) | `xcodec2-server` HTTP API server |
+| [quantize.cpp](file:///c:/Users/Administrator/Downloads/xcodec2-0.1.7.tar/xcodec2-0.1.7/ggml/quantize.cpp) | Quantization tool code |
+| [export_gguf.py](file:///c:/Users/Administrator/Downloads/xcodec2-0.1.7.tar/xcodec2-0.1.7/ggml/export_gguf.py) | PyTorch to GGUF model converter |
+
+---
 
 ## License
-
 MIT

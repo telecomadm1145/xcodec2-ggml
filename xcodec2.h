@@ -11,6 +11,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "ggml-backend.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -83,6 +84,16 @@ struct xcodec2_model {
     /* post_net: 2x ResnetBlock */
     struct xcodec2_resnet_block post_net[2];
 
+    /* Upsampler (optional, for 44.1kHz variants) */
+    int n_upsamplers; // 0 if no upsampler
+    struct {
+        struct ggml_tensor * conv_w; // [C_in, C_out, K]
+        struct ggml_tensor * conv_b; // [C_out]
+        struct xcodec2_resnet_block resnet;
+    } upsampler[4];
+    struct ggml_tensor * upsampler_out_proj_w;
+    struct ggml_tensor * upsampler_out_proj_b;
+
     /* ISTFTHead: Linear(1024, n_fft+2) */
     struct ggml_tensor * head_out_w;
     struct ggml_tensor * head_out_b;
@@ -93,12 +104,16 @@ struct xcodec2_model {
     /* ggml contexts */
     struct ggml_context   * ctx_data;    // holds weight data
     struct gguf_context   * ctx_gguf;    // GGUF file context
+
+    /* backend resources */
+    ggml_backend_t          backend;     // backend used for computation
+    ggml_backend_buffer_t   buffer_w;    // backend buffer for weights
 };
 
 /* ── API ─────────────────────────────────────────────────────── */
 
 /* Load model from GGUF file. Returns 0 on success. */
-int xcodec2_load(struct xcodec2_model * model, const char * path);
+int xcodec2_load(struct xcodec2_model * model, const char * path, bool use_gpu);
 
 /* Free model resources. */
 void xcodec2_free(struct xcodec2_model * model);
