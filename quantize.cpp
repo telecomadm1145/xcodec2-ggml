@@ -31,7 +31,7 @@ static bool should_skip_quantize(const char * name) {
     if (n.find(".bias")    != std::string::npos) return true;
     if (n.find("norm")     != std::string::npos) return true;
     if (n.find("window")   != std::string::npos) return true;
-    if (n.find("codebook") != std::string::npos) return true;
+    // if (n.find("codebook") != std::string::npos) return true;
     /* Keep 1D tensors (biases etc.) */
     return false;
 }
@@ -54,6 +54,9 @@ int main(int argc, char ** argv) {
     }
     enum ggml_type target_type = it->second;
     printf("Quantizing to %s\n", type_str);
+
+    std::vector<void *> allocated_buffers;
+    std::vector<struct ggml_context *> allocated_contexts;
 
     /* Load source GGUF */
     struct ggml_context * ctx_in = nullptr;
@@ -95,7 +98,8 @@ int main(int argc, char ** argv) {
         struct ggml_tensor * src = ggml_get_tensor(ctx_in, name);
         if (!src) { fprintf(stderr, "tensor not found: %s\n", name); continue; }
 
-        bool skip = should_skip_quantize(name) || ggml_n_dims(src) < 2;
+        int64_t block_size = ggml_blck_size(target_type);
+        bool skip = should_skip_quantize(name) || ggml_n_dims(src) < 2 || (block_size > 0 && src->ne[0] % block_size != 0);
 
         if (skip || src->type != GGML_TYPE_F32) {
             /* Keep as-is */
@@ -110,6 +114,7 @@ int main(int argc, char ** argv) {
             /* Create a temporary tensor with target type */
             size_t new_size = nelements * ggml_type_size(target_type) / ggml_blck_size(target_type);
             void * new_data = malloc(new_size);
+            allocated_buffers.push_back(new_data);
 
             /* Use ggml quantize functions */
             int64_t n_per_row = src->ne[0];
@@ -123,6 +128,8 @@ int main(int argc, char ** argv) {
                 .no_alloc = true,
             };
             struct ggml_context * tctx = ggml_init(tparams);
+            allocated_contexts.push_back(tctx);
+
             struct ggml_tensor * dst = ggml_new_tensor(tctx, target_type, ggml_n_dims(src), src->ne);
             ggml_set_name(dst, name);
             dst->data = new_data;
@@ -134,9 +141,6 @@ int main(int argc, char ** argv) {
                    name, ggml_type_name(src->type), ggml_type_name(target_type),
                    (float)(nelements * sizeof(float)) / 1048576.f,
                    (float)new_size / 1048576.f);
-
-            ggml_free(tctx);
-            free(new_data);
         }
     }
 
@@ -145,6 +149,14 @@ int main(int argc, char ** argv) {
     gguf_write_to_file(gguf_out, output_path, false);
 
     printf("Done! %d quantized, %d kept as-is\n", n_quantized, n_kept);
+
+    /* Free temporary contexts and buffers */
+    for (void * ptr : allocated_buffers) {
+        free(ptr);
+    }
+    for (struct ggml_context * ctx : allocated_contexts) {
+        ggml_free(ctx);
+    }
 
     gguf_free(gguf_out);
     ggml_free(ctx_in);
